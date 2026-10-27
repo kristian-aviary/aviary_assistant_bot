@@ -64,6 +64,12 @@ describe('Teams app manifest', () => {
     expect(TEAMS_APP_ID).not.toBe(BOT_ID);
   });
 
+  it('the app id can be overridden (registration routes that assign their own id) and must be a GUID', () => {
+    const other = '22222222-3333-4444-8555-666666666666';
+    expect(buildManifest({ botId: BOT_ID, appId: other }).id).toBe(other);
+    expect(() => buildManifest({ botId: BOT_ID, appId: 'nope' })).toThrow(/appId/);
+  });
+
   it('refuses a bot id that is not a GUID', () => {
     expect(() => buildManifest({ botId: 'not-a-guid' })).toThrow(/GUID/);
   });
@@ -72,7 +78,7 @@ describe('Teams app manifest', () => {
 describe('npm run package:app', () => {
   it('builds a zip with manifest.json and the two placeholder icons at the sizes Teams expects', () => {
     execFileSync('npx', ['tsx', 'scripts/package-app.ts'], { cwd: root, env: { ...process.env, CLIENT_ID: BOT_ID }, stdio: 'pipe' });
-    const files = unzipSync(new Uint8Array(readFileSync(path.join(root, 'appPackage/aviary-assistant.zip'))));
+    const files = unzipSync(new Uint8Array(readFileSync(path.join(root, 'appPackage/build/aviary-assistant.zip'))));
     expect(Object.keys(files).sort()).toEqual(['color.png', 'manifest.json', 'outline.png']);
     const manifest = JSON.parse(Buffer.from(files['manifest.json']!).toString('utf8'));
     expect(manifest.bots[0].botId).toBe(BOT_ID);

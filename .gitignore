@@ -6,4 +6,4 @@ dist/
 data/
 *.log
 .DS_Store
-appPackage/*.zip
+appPackage/build/

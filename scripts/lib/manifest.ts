@@ -18,6 +18,11 @@ export const TEAMS_APP_ID = '43d89c2d-145f-480a-bea7-39566082fb4e';
 export type ManifestInput = {
   /** The Entra app (client) id of the bot registration: the CLIENT_ID the service runs with. */
   botId: string;
+  /**
+   * Teams app id. Defaults to TEAMS_APP_ID (ours). Override only if the registration route
+   * (for example `teams app create`) assigns the app id itself and requires the manifest to match.
+   */
+  appId?: string;
   /** Semver of the app package. Bump it for every manifest or icon change that is re-uploaded. */
   appVersion?: string;
   developerName?: string;
@@ -30,11 +35,12 @@ const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function buildManifest(input: ManifestInput): Record<string, unknown> {
   if (!GUID.test(input.botId)) throw new Error('botId must be a GUID (the CLIENT_ID of the bot registration)');
+  if (input.appId !== undefined && !GUID.test(input.appId)) throw new Error('appId must be a GUID');
   return {
     $schema: MANIFEST_SCHEMA_URL,
     manifestVersion: MANIFEST_VERSION,
     version: input.appVersion ?? '0.1.0',
-    id: TEAMS_APP_ID,
+    id: input.appId ?? TEAMS_APP_ID,
     developer: {
       name: input.developerName ?? 'Aviary',
       websiteUrl: input.websiteUrl ?? 'https://example.com/aviary',

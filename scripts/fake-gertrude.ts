@@ -2,7 +2,7 @@
  * A stand-in for Gertrude's POST /api/internal/teams/verify, for local runs only.
  * Everything here is fake and committed on purpose: the token, the people, the ids.
  *
- *   FAKE_GERTRUDE_PORT=4010 npm run fake:gertrude
+ *   FAKE_GERTRUDE_PORT=4010 FAKE_GERTRUDE_USERS='you@example.com=samlp|aviary|you@example.com' npm run fake:gertrude
  *
  * Mirrors contract section 3: 401 on a bad bearer, 400 on a body with unknown keys,
  * 404 {"error":"NOT_FOUND"} for an unknown email or a tenant that is not allowed, else 200 {"user_id"}.
@@ -61,6 +61,14 @@ export async function startFakeGertrudeServer(opts: FakeGertrudeOptions = {}): P
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const port = Number(process.env.FAKE_GERTRUDE_PORT ?? 4010);
-  const { url } = await startFakeGertrudeServer({ port });
-  process.stdout.write(`fake Gertrude on ${url} (bearer ${FAKE_VERIFY_TOKEN}); known email: ${Object.keys(DEFAULT_FAKE_USERS).join(', ')}\n`);
+  const users = process.env.FAKE_GERTRUDE_USERS
+    ? Object.fromEntries(
+        process.env.FAKE_GERTRUDE_USERS.split(',').map((pair) => {
+          const [email = '', ...rest] = pair.split('=');
+          return [email.trim().toLowerCase(), rest.join('=').trim()];
+        }),
+      )
+    : DEFAULT_FAKE_USERS;
+  const { url } = await startFakeGertrudeServer({ port, users });
+  process.stdout.write(`fake Gertrude on ${url} (bearer ${FAKE_VERIFY_TOKEN}); known emails: ${Object.keys(users).join(', ')}\n`);
 }

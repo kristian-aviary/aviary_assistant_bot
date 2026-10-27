@@ -3,8 +3,10 @@
  *
  *   CLIENT_ID=<bot app id> npm run package:app
  *
- * Optional: APP_VERSION, APP_DEVELOPER_NAME, APP_WEBSITE_URL, APP_PRIVACY_URL, APP_TERMS_URL.
- * Output: appPackage/aviary-assistant.zip (git-ignored).
+ * Optional: APP_ID (override the Teams app id), APP_VERSION, APP_DEVELOPER_NAME, APP_WEBSITE_URL,
+ * APP_PRIVACY_URL, APP_TERMS_URL.
+ * Output (git-ignored): appPackage/build/{manifest.json, color.png, outline.png, aviary-assistant.zip}.
+ * The icons are generated placeholders; design will supply real ones.
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -12,7 +14,7 @@ import { zipSync } from 'fflate';
 import { buildManifest } from './lib/manifest.js';
 import { colorIcon, outlineIcon } from './lib/png.js';
 
-const outDir = path.resolve(import.meta.dirname, '..', 'appPackage');
+const outDir = path.resolve(import.meta.dirname, '..', 'appPackage', 'build');
 mkdirSync(outDir, { recursive: true });
 
 const botId = process.env.CLIENT_ID?.trim();
@@ -23,6 +25,7 @@ if (!botId) {
 
 const manifest = buildManifest({
   botId,
+  appId: process.env.APP_ID?.trim() || undefined,
   appVersion: process.env.APP_VERSION,
   developerName: process.env.APP_DEVELOPER_NAME,
   websiteUrl: process.env.APP_WEBSITE_URL,
@@ -30,6 +33,8 @@ const manifest = buildManifest({
   termsOfUseUrl: process.env.APP_TERMS_URL,
 });
 
+const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
+writeFileSync(path.join(outDir, 'manifest.json'), manifestJson);
 const color = colorIcon();
 const outline = outlineIcon();
 writeFileSync(path.join(outDir, 'color.png'), color);
@@ -37,7 +42,7 @@ writeFileSync(path.join(outDir, 'outline.png'), outline);
 
 const zip = zipSync(
   {
-    'manifest.json': Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8'),
+    'manifest.json': Buffer.from(manifestJson, 'utf8'),
     'color.png': [color, { level: 0 }],
     'outline.png': [outline, { level: 0 }],
   },
