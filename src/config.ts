@@ -16,7 +16,6 @@ const httpUrl = (name: string) =>
   );
 
 const schema = z.object({
-  DATABASE_URL: required('DATABASE_URL'),
   GERTRUDE_URL: httpUrl('GERTRUDE_URL'),
   GERTRUDE_VERIFY_TOKEN: required('GERTRUDE_VERIFY_TOKEN'),
   SEND_SERVICE_TOKEN: required('SEND_SERVICE_TOKEN'),
@@ -33,7 +32,6 @@ const schema = z.object({
 });
 
 export type Config = {
-  databaseUrl: string;
   gertrudeUrl: string;
   gertrudeVerifyToken: string;
   sendServiceToken: string;
@@ -83,7 +81,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
   return {
-    databaseUrl: v.DATABASE_URL,
     gertrudeUrl: v.GERTRUDE_URL.replace(/\/+$/, ''),
     gertrudeVerifyToken: v.GERTRUDE_VERIFY_TOKEN,
     sendServiceToken: v.SEND_SERVICE_TOKEN,

@@ -1,23 +1,32 @@
-import { json, startFake, type FakeServer } from './httpFake.js';
-import { USER_ID } from './constants.js';
+import { json, startFake, type FakeServer, type RecordedRequest } from './httpFake.js';
 
 export type GertrudeBehavior =
-  | { type: 'ok'; userId?: string; body?: unknown }
+  | { type: 'ok'; status?: 'created' | 'refreshed'; removed?: boolean; body?: unknown }
   | { type: 'status'; status: number; body?: unknown }
   | { type: 'timeout' }
   | { type: 'reset' };
 
-export type FakeGertrude = FakeServer & { behavior: GertrudeBehavior; verifyCalls(): number };
+export const LINK_URL = '/api/internal/teams/reference';
+export const REMOVE_URL = '/api/internal/teams/reference/remove';
+
+export type FakeGertrude = FakeServer & {
+  behavior: GertrudeBehavior;
+  /** Requests that reached the link route (the PUT). */
+  linkCalls(): RecordedRequest[];
+  removeCalls(): RecordedRequest[];
+};
 
 export async function startFakeGertrude(expectedToken: string, initial: GertrudeBehavior = { type: 'ok' }): Promise<FakeGertrude> {
   const holder: { behavior: GertrudeBehavior } = { behavior: initial };
   const server = await startFake((req, res) => {
-    if (req.method !== 'POST' || req.url !== '/api/internal/teams/verify') return json(res, 404, { error: 'NOT_FOUND' });
+    const isLink = req.method === 'PUT' && req.url === LINK_URL;
+    const isRemove = req.method === 'POST' && req.url === REMOVE_URL;
+    if (!isLink && !isRemove) return json(res, 404, { error: 'NOT_FOUND' });
     if (req.headers.authorization !== `Bearer ${expectedToken}`) return json(res, 401, { error: 'UNAUTHORIZED' });
     const b = holder.behavior;
     switch (b.type) {
       case 'ok':
-        return json(res, 200, b.body ?? { user_id: b.userId ?? USER_ID });
+        return json(res, 200, b.body ?? (isLink ? { status: b.status ?? 'created' } : { removed: b.removed ?? true }));
       case 'status':
         return json(res, b.status, b.body ?? { error: 'X' });
       case 'timeout':
@@ -28,6 +37,7 @@ export async function startFakeGertrude(expectedToken: string, initial: Gertrude
   });
   return Object.defineProperties(server, {
     behavior: { get: () => holder.behavior, set: (v: GertrudeBehavior) => (holder.behavior = v), enumerable: true },
-    verifyCalls: { value: () => server.requests.filter((r) => r.url === '/api/internal/teams/verify').length },
+    linkCalls: { value: () => server.requests.filter((r) => r.method === 'PUT' && r.url === LINK_URL) },
+    removeCalls: { value: () => server.requests.filter((r) => r.method === 'POST' && r.url === REMOVE_URL) },
   }) as FakeGertrude;
 }

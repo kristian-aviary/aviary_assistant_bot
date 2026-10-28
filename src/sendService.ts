@@ -1,7 +1,8 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import type { Logger } from './logger.js';
-import type { ConversationReferenceStore, IdempotencyRow, IdempotencyStore } from './repositories.js';
+import type { IdempotencyEntry, IdempotencyStore } from './idempotency.js';
+import { normalizeServiceUrl, type ServiceUrlPolicy } from './serviceUrl.js';
 import { classifyTeamsError, PreDispatchError, type TeamsFailure } from './teamsErrors.js';
 import type { TeamsSender } from './teamsSender.js';
 
@@ -17,8 +18,9 @@ export type SendRequest = {
 
 export type SendServiceDeps = {
   token: string;
-  references: ConversationReferenceStore;
   idempotency: IdempotencyStore;
+  /** Same policy as at install. The bot attaches a bearer token when it calls this URL, so it is checked on every send. */
+  serviceUrlPolicy: ServiceUrlPolicy;
   sender: TeamsSender;
   logger: Logger;
   /** Total budget for one send, including token acquisition. Gertrude waits 10 s; Teams gets 8 s of it. */
@@ -30,7 +32,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const bodySchema = z
   .object({
-    user_id: z.string().min(1).max(512),
+    conversation_id: z.string().min(1).max(512),
+    service_url: z.string(),
     card: z.looseObject({ type: z.literal('AdaptiveCard') }),
     fallback_text: z.string().min(1).max(20_000),
   })
@@ -41,9 +44,11 @@ const unknownResponse: SendResponse = { status: 409, body: { status: 'unknown' }
 
 export function bearerMatches(header: string | undefined, expected: string): boolean {
   const presented = header?.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
+  // An empty expected or presented token never authenticates, even if both are empty.
+  const nonEmpty = presented.length > 0 && expected.length > 0;
   const a = createHash('sha256').update(presented).digest();
   const b = createHash('sha256').update(expected).digest();
-  return timingSafeEqual(a, b);
+  return timingSafeEqual(a, b) && nonEmpty;
 }
 
 export class SendService {
@@ -103,24 +108,18 @@ export class SendService {
       return invalid('card exceeds 25 KB');
     }
 
-    const existing = await this.deps.idempotency.find(key);
-    if (existing) return this.replay(key, existing, body.user_id);
+    const serviceUrl = normalizeServiceUrl(body.service_url, this.deps.serviceUrlPolicy);
+    if (!serviceUrl) return invalid('service_url is not allowed');
 
-    const ref = await this.deps.references.get(body.user_id);
-    if (!ref) {
-      logger.info('send_no_reference', { delivery_id: key, status: 'no_reference' });
-      return { status: 404, body: { status: 'no_reference' } };
-    }
+    const claim = this.deps.idempotency.claim(key, body.conversation_id);
+    if (!claim.claimed) return this.replay(key, claim.entry, body.conversation_id);
 
-    const claim = await this.deps.idempotency.claim(key, body.user_id);
-    if (!claim.claimed) return this.replay(key, claim.row, body.user_id);
-
-    return this.deliver(key, ref, body);
+    return this.deliver(key, { conversationId: body.conversation_id, serviceUrl }, body);
   }
 
   private async deliver(
     key: string,
-    ref: { conversationId: string; serviceUrl: string },
+    target: { conversationId: string; serviceUrl: string },
     body: z.infer<typeof bodySchema>,
   ): Promise<SendResponse> {
     const { logger, idempotency } = this.deps;
@@ -130,7 +129,7 @@ export class SendService {
 
     const attempt = this.deps.sender
       .send(
-        { conversationId: ref.conversationId, serviceUrl: ref.serviceUrl },
+        target,
         { text: body.fallback_text, card: body.card },
         {
           onDispatched: () => {
@@ -161,12 +160,7 @@ export class SendService {
     // A response arriving after the deadline is ignored: the outcome below is final.
 
     if (result.ok) {
-      try {
-        await idempotency.markSent(key, result.activityId);
-      } catch {
-        // Teams accepted it. The row stays in_progress, which replays as unknown: safe, never a duplicate.
-        logger.error('send_state_write_failed', { delivery_id: key, code: 'STATE_WRITE_AFTER_SENT' });
-      }
+      idempotency.markSent(key, result.activityId);
       logger.info('send_sent', { delivery_id: key, status: 'sent' });
       return { status: 200, body: { status: 'sent', activity_id: result.activityId } };
     }
@@ -174,56 +168,49 @@ export class SendService {
     return this.recordFailure(key, result.failure);
   }
 
-  private async recordFailure(key: string, failure: TeamsFailure): Promise<SendResponse> {
+  private recordFailure(key: string, failure: TeamsFailure): SendResponse {
     const { logger, idempotency } = this.deps;
     const log = { delivery_id: key, code: failure.code };
-    try {
-      switch (failure.kind) {
-        case 'blocked':
-          await idempotency.markFailedPermanent(key, 'blocked_or_uninstalled');
-          logger.warn('send_failed', { ...log, status: 'blocked_or_uninstalled' });
-          return { status: 403, body: { status: 'blocked_or_uninstalled' } };
-        case 'rejected':
-          await idempotency.markFailedPermanent(key, 'invalid_request');
-          logger.error('send_failed', { ...log, status: 'invalid_request' });
-          return { status: 400, body: { status: 'invalid_request', detail: 'Teams rejected the activity' } };
-        case 'rate_limited': {
-          await idempotency.release(key);
-          logger.warn('send_failed', { ...log, status: 'rate_limited' });
-          const headers = failure.retryAfterSeconds === undefined ? undefined : { 'Retry-After': String(failure.retryAfterSeconds) };
-          return { status: 429, body: { status: 'rate_limited' }, ...(headers ? { headers } : {}) };
-        }
-        case 'unavailable':
-          await idempotency.release(key);
-          if (failure.code === 'teams_401_credentials' || failure.code === 'no_credentials') {
-            logger.critical('send_failed', { ...log, status: 'unavailable' });
-          } else {
-            logger.warn('send_failed', { ...log, status: 'unavailable' });
-          }
-          return unavailable;
-        case 'unknown':
-          await idempotency.markUnknown(key);
-          logger.warn('send_failed', { ...log, status: 'unknown' });
-          return unknownResponse;
+    switch (failure.kind) {
+      case 'blocked':
+        idempotency.markFailedPermanent(key, 'blocked_or_uninstalled');
+        logger.warn('send_failed', { ...log, status: 'blocked_or_uninstalled' });
+        return { status: 403, body: { status: 'blocked_or_uninstalled' } };
+      case 'rejected':
+        idempotency.markFailedPermanent(key, 'invalid_request');
+        logger.error('send_failed', { ...log, status: 'invalid_request' });
+        return { status: 400, body: { status: 'invalid_request', detail: 'Teams rejected the activity' } };
+      case 'rate_limited': {
+        idempotency.release(key);
+        logger.warn('send_failed', { ...log, status: 'rate_limited' });
+        const headers = failure.retryAfterSeconds === undefined ? undefined : { 'Retry-After': String(failure.retryAfterSeconds) };
+        return { status: 429, body: { status: 'rate_limited' }, ...(headers ? { headers } : {}) };
       }
-    } catch {
-      // State could not be written. The key stays in_progress (replays as unknown), so the
-      // answer must not claim a clean failure: ambiguous is the only safe thing to say.
-      logger.error('send_state_write_failed', { delivery_id: key, code: 'STATE_WRITE_AFTER_FAILURE' });
-      return unknownResponse;
+      case 'unavailable':
+        idempotency.release(key);
+        if (failure.code === 'teams_401_credentials' || failure.code === 'no_credentials') {
+          logger.critical('send_failed', { ...log, status: 'unavailable' });
+        } else {
+          logger.warn('send_failed', { ...log, status: 'unavailable' });
+        }
+        return unavailable;
+      case 'unknown':
+        idempotency.markUnknown(key);
+        logger.warn('send_failed', { ...log, status: 'unknown' });
+        return unknownResponse;
     }
   }
 
-  private replay(key: string, row: IdempotencyRow, userId: string): SendResponse {
+  private replay(key: string, entry: IdempotencyEntry, conversationId: string): SendResponse {
     const { logger } = this.deps;
-    if (row.userId !== userId) return invalid('Idempotency-Key was already used for a different user');
-    switch (row.status) {
+    if (entry.conversationId !== conversationId) return invalid('Idempotency-Key was already used for a different conversation');
+    switch (entry.status) {
       case 'sent':
         logger.info('send_replayed', { delivery_id: key, status: 'sent' });
-        return { status: 200, body: { status: 'sent', activity_id: row.activityId, replayed: true } };
+        return { status: 200, body: { status: 'sent', activity_id: entry.activityId, replayed: true } };
       case 'failed_permanent':
-        logger.info('send_replayed', { delivery_id: key, status: row.outcome ?? 'failed_permanent' });
-        return row.outcome === 'invalid_request'
+        logger.info('send_replayed', { delivery_id: key, status: entry.outcome ?? 'failed_permanent' });
+        return entry.outcome === 'invalid_request'
           ? { status: 400, body: { status: 'invalid_request', detail: 'Teams rejected the activity' } }
           : { status: 403, body: { status: 'blocked_or_uninstalled' } };
       case 'unknown':

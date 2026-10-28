@@ -32,8 +32,9 @@ tenant, with one test user who has a mailbox and Teams, and an admin who can upl
      `sdk_log` warn if token validation failed)?
    - Did the roster email come back (no `EMAIL_UNAVAILABLE`), and did the fake or real Gertrude get the
      tenant B id?
-   - With the user **not** having written anything, `POST /v1/send` with a card to that user: does it answer `200`
-     and does the card appear? Then close Teams for the user and send again.
+   - With the user **not** having written anything, `POST /v1/send` with a card for that user's conversation (the
+     `conversation_id` and `service_url` Gertrude holds for them): does it answer `200` and does the card appear?
+     Then close Teams for the user and send again.
 4. If any observation fails, repeat steps 1 to 3 with the registration recreated as multi-tenant
    (`--sign-in-audience multipleOrgs`), and then with Azure Bot Service (step 9). The first variant that passes all
    three is the pilot configuration. Record which one.
@@ -95,8 +96,8 @@ teams app update <appId> --endpoint https://<id>-3978.<region>.devtunnels.ms/api
 ```
 
 Anonymous access is needed because Microsoft's Bot Framework service calls the endpoint without a dev-tunnel
-login; the bot still validates every inbound token itself. Then run the service with real env vars against a
-local Postgres, and a fake Gertrude if the real one is not reachable (`npm run fake:gertrude`, see its header
+login; the bot still validates every inbound token itself. Then run the service with real env vars, and a fake
+Gertrude if the real one is not reachable (`npm run fake:gertrude`, see its header
 for its fixed bearer; set `FAKE_GERTRUDE_USERS='<email>=<user_id>,...'` to the test user's roster email; the bot's
 `GERTRUDE_VERIFY_TOKEN` must equal that bearer).
 
@@ -153,8 +154,8 @@ later.
 ### 10. Pin or pre-install for users (optional)
 
 A Teams setup policy can pre-install and pin the app for users. Out of scope for v0 beyond mentioning it:
-this service does not onboard people who have not installed the bot, and `POST /v1/send` answers `404 no_reference`
-for them.
+this service does not onboard people who have not installed the bot. Gertrude holds the conversation reference, so a
+user who has never opened the bot has none to send to.
 
 ## What changes for a recipient in a customer's tenant
 

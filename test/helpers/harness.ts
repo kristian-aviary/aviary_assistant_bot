@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Config } from '../../src/config.js';
 import type { InboundPorts } from '../../src/inbound.js';
 import { HttpGertrudeClient } from '../../src/gertrude.js';
+import { InMemoryIdempotencyStore, type IdempotencyStore } from '../../src/idempotency.js';
 import { startService, type RunningService } from '../../src/server.js';
 import { DEFAULT_SERVICE_URL_HOSTS } from '../../src/serviceUrl.js';
 import type { TeamsSender } from '../../src/teamsSender.js';
@@ -21,10 +22,9 @@ import { startFakeConnector, type FakeConnector } from './fakeConnector.js';
 import { startFakeGertrude, type FakeGertrude, type GertrudeBehavior } from './fakeGertrude.js';
 import { startFakeIdentityProvider, type FakeIdentityProvider } from './jwks.js';
 import { captureLogs, type LogCapture } from './logs.js';
-import { createTestDb, type TestDb } from './pg.js';
 
 export type Harness = {
-  db: TestDb;
+  idempotency: IdempotencyStore;
   logs: LogCapture;
   gertrude: FakeGertrude;
   connector: FakeConnector;
@@ -33,6 +33,8 @@ export type Harness = {
   config: Config;
   baseUrl: string;
   serviceUrl: string;
+  /** A valid send body for this harness's fake connector; override any field. */
+  body(overrides?: Record<string, unknown>): Record<string, unknown>;
   send(body?: unknown, opts?: { token?: string | null; key?: string | null; headers?: Record<string, string> }): Promise<{ status: number; body: any; headers: Headers; key: string }>;
   postActivity(activity: unknown, token?: string | null): Promise<{ status: number; body: string }>;
   signedActivityPost(activity: unknown): Promise<{ status: number; body: string }>;
@@ -48,16 +50,17 @@ export type HarnessOptions = {
   drainTimeoutMs?: number;
   gertrudeTimeoutMs?: number;
   teamsTimeoutMs?: number;
+  /** Injected clock for the idempotency store. */
+  now?: () => number;
+  maxIdempotencyEntries?: number;
 };
 
 export async function createHarness(opts: HarnessOptions = {}): Promise<Harness> {
-  const db = await createTestDb();
   const logs = opts.logs ?? captureLogs();
   const gertrude = await startFakeGertrude(VERIFY_TOKEN, opts.gertrude);
   const connector = await startFakeConnector();
   const idp = await startFakeIdentityProvider();
   const config: Config = {
-    databaseUrl: db.url,
     gertrudeUrl: gertrude.url,
     gertrudeVerifyToken: VERIFY_TOKEN,
     sendServiceToken: SEND_TOKEN,
@@ -67,9 +70,10 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     port: 0,
     extraServiceUrlHosts: [],
   };
+  const idempotency = new InMemoryIdempotencyStore({ now: opts.now, maxEntries: opts.maxIdempotencyEntries });
   const botToken = await idp.signToken({ expiresInSeconds: 3600 });
   const service = await startService(config, logs.logger, {
-    pool: db.pool,
+    idempotency,
     sender: opts.sender,
     gertrude: opts.gertrudeTimeoutMs ? new HttpGertrudeClient(gertrude.url, VERIFY_TOKEN, opts.gertrudeTimeoutMs) : undefined,
     ports: opts.ports,
@@ -84,7 +88,7 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
   const serviceUrl = `${connector.url}/emea/`;
 
   const harness: Harness = {
-    db,
+    idempotency,
     logs,
     gertrude,
     connector,
@@ -93,7 +97,8 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     config,
     baseUrl,
     serviceUrl,
-    async send(body = sendBody(), o = {}) {
+    body: (overrides = {}) => sendBody({ service_url: serviceUrl, ...overrides }),
+    async send(body = harness.body(), o = {}) {
       const key = o.key === null ? '' : (o.key ?? randomUUID());
       const headers: Record<string, string> = { 'content-type': 'application/json', ...o.headers };
       if (o.token !== null) headers.authorization = `Bearer ${o.token ?? SEND_TOKEN}`;
@@ -121,7 +126,6 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     async stop() {
       await service.stop().catch(() => {});
       await Promise.all([gertrude.close(), connector.close(), idp.close()]);
-      await db.drop();
     },
   };
   return harness;

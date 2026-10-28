@@ -1,8 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { CARD_TEXT, CLIENT_ID, CONVERSATION_ID, FALLBACK_TEXT, sampleCard, sendBody } from './helpers/constants.js';
+import { CARD_TEXT, CLIENT_ID, CONVERSATION_ID, FALLBACK_TEXT, sampleCard } from './helpers/constants.js';
 import { createHarness, type Harness } from './helpers/harness.js';
 import { assertCleanLogsAfterAll, captureLogs } from './helpers/logs.js';
-import { seedReference } from './helpers/seed.js';
 
 const logs = captureLogs();
 assertCleanLogsAfterAll(logs);
@@ -14,17 +13,19 @@ beforeAll(async () => {
 afterAll(async () => {
   await h.stop();
 });
-beforeEach(async () => {
+beforeEach(() => {
   h.connector.requests.length = 0;
   h.connector.activityBehavior = { type: 'ok' };
-  await h.db.pool.query('truncate send_idempotency, conversation_reference');
-  await seedReference(h.db.pool, h.serviceUrl);
 });
 
-const rowFor = async (key: string) => (await h.db.pool.query('select status, outcome, activity_id from send_idempotency where key = $1', [key])).rows[0];
+const sendBody = (overrides: Record<string, unknown> = {}) => h.body(overrides);
+const rowFor = (key: string) => {
+  const e = h.idempotency.find(key);
+  return e ? { status: e.status, outcome: e.outcome, activity_id: e.activityId } : undefined;
+};
 
 describe('/v1/send through the real SDK client against a fake Bot Connector', () => {
-  it('posts one Adaptive Card message to the stored conversation on the stored service URL, with the bot token', async () => {
+  it('posts one Adaptive Card message to the requested conversation on the requested service URL, with the bot token', async () => {
     h.connector.activityBehavior = { type: 'ok', id: 'connector-id-9' };
     const card = sampleCard();
     const r = await h.send(sendBody({ card }));
@@ -44,7 +45,7 @@ describe('/v1/send through the real SDK client against a fake Bot Connector', ()
       conversation: { id: CONVERSATION_ID },
     });
     expect(JSON.stringify(req.body)).toContain(CARD_TEXT);
-    expect(await rowFor(r.key)).toMatchObject({ status: 'sent', activity_id: 'connector-id-9' });
+    expect(rowFor(r.key)).toMatchObject({ status: 'sent', activity_id: 'connector-id-9' });
   });
 
   it('does not retry on its own: a failing connector sees exactly one request', async () => {
@@ -69,14 +70,14 @@ describe('/v1/send through the real SDK client against a fake Bot Connector', ()
     expect(r.status).toBe(status);
     expect(r.body).toEqual(body);
     if (teams === 429) expect(r.headers.get('retry-after')).toBe('3');
-    expect((await rowFor(r.key))?.status).toBe(stored);
+    expect((rowFor(r.key))?.status).toBe(stored);
   });
 
   it('connection reset after the request was written -> 409 unknown', async () => {
     h.connector.activityBehavior = { type: 'reset' };
     const r = await h.send();
     expect(r.status).toBe(409);
-    expect((await rowFor(r.key)).status).toBe('unknown');
+    expect(rowFor(r.key)?.status).toBe('unknown');
   });
 
   it('connector never answers: the SDK client timeout fires after dispatch -> 409 unknown (proves the dispatch hook fires)', async () => {
@@ -85,25 +86,30 @@ describe('/v1/send through the real SDK client against a fake Bot Connector', ()
     const r = await h.send();
     expect(r.status).toBe(409);
     expect(Date.now() - started).toBeLessThan(2500);
-    expect((await rowFor(r.key)).status).toBe('unknown');
+    expect(rowFor(r.key)?.status).toBe('unknown');
     expect(h.connector.activities()).toHaveLength(1);
   });
 
   it('connection refused (nothing written) -> 503 and the key is released', async () => {
-    await h.db.pool.query('truncate conversation_reference');
-    await seedReference(h.db.pool, 'http://127.0.0.1:1/emea/');
-    const r = await h.send();
+    const r = await h.send(sendBody({ service_url: 'http://127.0.0.1:1/emea/' }));
     expect(r.status).toBe(503);
-    expect(await rowFor(r.key)).toBeUndefined();
+    expect(rowFor(r.key)).toBeUndefined();
   });
 
-  it('a stored service URL that no longer passes the allowlist is never contacted: 503, released', async () => {
-    await h.db.pool.query('truncate conversation_reference');
-    await seedReference(h.db.pool, `${h.connector.url.replace('127.0.0.1', 'localhost')}/emea/`.replace('http://', 'https://'));
-    const r = await h.send();
-    expect(r.status).toBe(503);
+  it('a service URL that is not on the allowlist is never contacted: 400, the key is not claimed, the connector sees nothing', async () => {
+    // Same machine, but not the one allowed loopback form: https with a host name that is not allow-listed.
+    const lookalike = `${h.connector.url.replace('127.0.0.1', 'localhost')}/emea/`.replace('http://', 'https://');
+    const r = await h.send(sendBody({ service_url: lookalike }));
+    expect(r.status).toBe(400);
+    expect(r.body.status).toBe('invalid_request');
     expect(h.connector.requests).toHaveLength(0);
-    expect(await rowFor(r.key)).toBeUndefined();
-    expect(logs.records().some((l) => l.code === 'service_url_rejected')).toBe(true);
+    expect(rowFor(r.key)).toBeUndefined();
+  });
+
+  it('the bot token is never attached to a request for a rejected service URL (lookalike hosts)', async () => {
+    for (const service_url of ['https://smba.trafficmanager.net.evil.com/emea/', 'https://smba.trafficmanager.net@evil.com/emea/', 'http://smba.trafficmanager.net/emea/']) {
+      expect((await h.send(sendBody({ service_url }))).status).toBe(400);
+    }
+    expect(h.connector.requests).toHaveLength(0);
   });
 });

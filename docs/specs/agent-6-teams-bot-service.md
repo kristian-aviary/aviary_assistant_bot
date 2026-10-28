@@ -1,3 +1,4 @@
+> Historical spec (v1). The current contract is `teams-bot-v2`: see docs/CONTRACT.md. The bot is now stateless (no database).
 Use Opus 5.5 as advisor, rely on it when necessary, use Haiku subagents efficiently (not just one subagent unless that makes sense).
 
 # Agent 6: The Aviary Teams bot service (new repo)

@@ -1,8 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { SENSITIVE, sendBody } from './helpers/constants.js';
+import { SENSITIVE } from './helpers/constants.js';
 import { activity, createHarness, type Harness } from './helpers/harness.js';
 import { expectCleanLogs } from './helpers/logs.js';
-import { seedReference } from './helpers/seed.js';
 
 let h: Harness;
 const written: string[] = [];
@@ -41,7 +40,6 @@ describe('nothing the SDK or its dependencies print can leak', () => {
     await h.signedActivityPost(activity({ serviceUrl: h.serviceUrl }));
     h.gertrude.behavior = { type: 'ok' };
     await h.signedActivityPost(activity({ serviceUrl: h.serviceUrl }));
-    await seedReference(h.db.pool, h.serviceUrl).catch(() => undefined);
     for (const behavior of [
       { type: 'status', status: 403 },
       { type: 'status', status: 429 },
@@ -51,7 +49,7 @@ describe('nothing the SDK or its dependencies print can leak', () => {
       { type: 'ok' },
     ] as const) {
       h.connector.activityBehavior = behavior;
-      await h.send(sendBody());
+      await h.send();
     }
 
     const output = written.join('');

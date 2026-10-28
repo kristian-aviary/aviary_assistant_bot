@@ -15,23 +15,21 @@ beforeAll(async () => {
 afterAll(async () => {
   await h.stop();
 });
-beforeEach(async () => {
+beforeEach(() => {
   h.gertrude.requests.length = 0;
   h.connector.requests.length = 0;
-  await h.db.pool.query('truncate conversation_reference');
 });
 
 const nothingHappened = async () => {
-  expect(h.gertrude.verifyCalls()).toBe(0);
+  expect(h.gertrude.requests).toHaveLength(0);
   expect(h.connector.requests).toHaveLength(0);
-  expect((await h.db.pool.query('select count(*)::int as n from conversation_reference')).rows[0].n).toBe(0);
 };
 
 describe('the SDK validates every inbound token on /api/messages (validation is never bypassed)', () => {
   it('a correctly signed token for our app runs the handler', async () => {
     const res = await h.signedActivityPost(activity({ serviceUrl: h.serviceUrl }));
     expect(res.status).toBe(200);
-    expect(h.gertrude.verifyCalls()).toBe(1);
+    expect(h.gertrude.linkCalls()).toHaveLength(1);
   });
 
   it('no Authorization header: 401', async () => {
