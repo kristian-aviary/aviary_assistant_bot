@@ -110,6 +110,13 @@ describe('strict body', () => {
     ['empty conversation_id', sendBody({ conversation_id: '' })],
     ['conversation_id not a string', sendBody({ conversation_id: 7 })],
     ['conversation_id over 512', sendBody({ conversation_id: 'c'.repeat(513) })],
+    ['conversation_id with a slash (path change)', sendBody({ conversation_id: 'a:1/../../v3/other' })],
+    ['conversation_id with a query', sendBody({ conversation_id: 'a:1?x=1' })],
+    ['conversation_id with a fragment', sendBody({ conversation_id: 'a:1#x' })],
+    ['conversation_id with a backslash', sendBody({ conversation_id: 'a:1\\2' })],
+    ['conversation_id with a percent escape', sendBody({ conversation_id: 'a:1%2f2' })],
+    ['conversation_id with whitespace', sendBody({ conversation_id: 'a:1 2' })],
+    ['conversation_id with a control character', sendBody({ conversation_id: 'a:1\n2' })],
     ['missing service_url', { conversation_id: CONVERSATION_ID, card, fallback_text: 'x' }],
     ['missing card', { conversation_id: CONVERSATION_ID, service_url: ALLOWED_SERVICE_URL, fallback_text: 'x' }],
     ['card is a string', sendBody({ card: 'AdaptiveCard' })],
@@ -133,6 +140,15 @@ describe('strict body', () => {
     expect(sender.calls).toHaveLength(0);
     expect(idempotency.size).toBe(0);
   });
+
+  it.each(['a:1AbC-def_GHI', '19:abc123@thread.v2', '19:abc@thread.tacv2;messageid=1700000000000', '29:1-user.id'])(
+    'real-looking Teams conversation id %s is accepted',
+    async (conversation_id) => {
+      const { send, sender } = setup();
+      expect((await send(sendBody({ conversation_id }))).status).toBe(200);
+      expect(sender.calls[0]!.target.conversationId).toBe(conversation_id);
+    },
+  );
 
   it('conversation_id of exactly 512 characters is accepted', async () => {
     const { send } = setup();

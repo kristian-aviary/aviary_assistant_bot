@@ -32,7 +32,13 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const bodySchema = z
   .object({
-    conversation_id: z.string().min(1).max(512),
+    // The id becomes a path segment of the Teams URL (with a bearer token attached), so anything that could
+    // change the path or query is refused. Real Teams ids (a:..., 19:...@thread.v2) never contain these.
+    conversation_id: z
+      .string()
+      .min(1)
+      .max(512)
+      .refine((v) => !/[\/?#\\%\s\u0000-\u001f\u007f]/.test(v), 'conversation_id has characters that are not allowed'),
     service_url: z.string(),
     card: z.looseObject({ type: z.literal('AdaptiveCard') }),
     fallback_text: z.string().min(1).max(20_000),

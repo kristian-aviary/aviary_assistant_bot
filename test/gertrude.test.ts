@@ -116,6 +116,15 @@ describe('linkReference: PUT /api/internal/teams/reference', () => {
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
+  it('a timeout while the response body is being read is a timeout, not a bad body', async () => {
+    respond = (res) => {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' });
+      res.write('{"status"'); // headers sent, body never finishes
+    };
+    const c = await client(150);
+    await expect(c.linkReference(link)).resolves.toEqual({ kind: 'unavailable', code: 'timeout' });
+  });
+
   it('a reset connection is unavailable network', async () => {
     respond = (res) => res.destroy();
     const c = await client();

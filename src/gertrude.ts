@@ -114,8 +114,9 @@ export class HttpGertrudeClient implements GertrudeClient {
 
     try {
       return await classify(res.status, () => res.json());
-    } catch {
-      return failed('bad_body');
+    } catch (err) {
+      const name = (err as { name?: string } | null)?.name;
+      return failed(name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'bad_body');
     } finally {
       await res.body?.cancel().catch(() => {});
     }

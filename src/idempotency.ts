@@ -67,11 +67,7 @@ export class InMemoryIdempotencyStore implements IdempotencyStore {
     this.sweep();
     const existing = this.slots.get(key);
     if (existing) return { claimed: false, entry: toEntry(existing) };
-    while (this.slots.size >= this.maxEntries) {
-      const oldest = this.slots.keys().next();
-      if (oldest.done) break;
-      this.slots.delete(oldest.value);
-    }
+    while (this.slots.size >= this.maxEntries) this.evictOldest();
     this.slots.set(key, { key, conversationId, status: 'in_progress', outcome: null, activityId: null, claimedAt: this.now() });
     return { claimed: true };
   }
@@ -101,6 +97,22 @@ export class InMemoryIdempotencyStore implements IdempotencyStore {
 
   release(key: string): boolean {
     return this.inProgress(key) ? this.slots.delete(key) : false;
+  }
+
+  /**
+   * Oldest first. A send that is still in flight is passed over while anything finished can go instead,
+   * so eviction cannot turn a live claim into a free key; only if every entry is in flight does the oldest go.
+   */
+  private evictOldest(): void {
+    let fallback: string | undefined;
+    for (const [key, slot] of this.slots) {
+      fallback ??= key;
+      if (slot.status !== 'in_progress') {
+        this.slots.delete(key);
+        return;
+      }
+    }
+    if (fallback !== undefined) this.slots.delete(fallback);
   }
 
   private inProgress(key: string): Slot | undefined {

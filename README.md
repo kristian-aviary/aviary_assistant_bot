@@ -247,4 +247,5 @@ outside the team sees the app.
   `null` (or treat it as an empty provider id).
 - The v1 `CONTRACT.md` left two points open, both resolved above: which 5xx count as "provably not accepted" (503
   only), and what a reused `Idempotency-Key` for a different conversation gets (refused, nothing sent).
+- `conversation_id` is also refused when it contains `/ ? # \ %`, whitespace or control characters (the contract only says non-empty, at most 512): it becomes a path segment of the Teams URL that carries the bot token. Real Teams ids never contain these.
 - Adds optional `SERVICE_URL_ALLOWED_HOSTS` to the listed variables.

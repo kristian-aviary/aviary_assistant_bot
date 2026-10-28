@@ -270,13 +270,31 @@ describe('idempotency (in memory, injected clock)', () => {
       expect(small.find('k997')).toBeNull();
     });
 
-    it('an evicted in-flight send finishes normally (its state writes are no-ops, nothing throws)', async () => {
+    it('eviction passes over a send that is still in flight while a finished entry can go instead', async () => {
+      build(2);
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      sender.enqueue({ type: 'gate', gate });
+      const slowKey = randomUUID();
+      const slow = send(slowKey); // oldest, in flight
+      const doneKey = randomUUID();
+      await send(doneKey); // finished
+      await send(randomUUID()); // cap reached: the finished one goes, not the in-flight one
+      expect(store.find(slowKey)?.status).toBe('in_progress');
+      expect(store.find(doneKey)).toBeNull();
+      expect((await send(slowKey)).status).toBe(409); // still claimed: no duplicate send
+      release();
+      expect((await slow).status).toBe(200);
+      expect(store.find(slowKey)?.status).toBe('sent');
+    });
+
+    it('an evicted in-flight send (only possible when every entry is in flight) finishes normally (its state writes are no-ops, nothing throws)', async () => {
       build(1);
       let release!: () => void;
       const gate = new Promise<void>((r) => (release = r));
       sender.enqueue({ type: 'gate', gate });
       const slow = send(randomUUID());
-      await send(randomUUID()); // claims a slot, evicting the in-flight entry
+      await send(randomUUID()); // claims a slot; with only an in-flight entry to evict, that one goes
       release();
       expect((await slow).status).toBe(200);
       expect(store.size).toBe(1);
