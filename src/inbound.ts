@@ -1,6 +1,5 @@
-import type { GertrudeClient } from './gertrude.js';
+import type { GertrudeClient, LinkResult } from './gertrude.js';
 import type { Logger } from './logger.js';
-import type { ConversationReferenceStore } from './repositories.js';
 import { normalizeServiceUrl, type ServiceUrlPolicy } from './serviceUrl.js';
 
 export const MESSAGES = {
@@ -46,7 +45,6 @@ export type InboundOutcome =
 export class InboundService {
   constructor(
     private readonly deps: {
-      references: ConversationReferenceStore;
       gertrude: GertrudeClient;
       ports: InboundPorts;
       logger: Logger;
@@ -82,20 +80,35 @@ export class InboundService {
     return outcome;
   }
 
+  /** Best effort: the result class is logged, nothing is retried, and nothing escapes this method. */
   private async remove(ev: InboundEvent, isPersonal: boolean): Promise<InboundOutcome> {
-    const tenantId = ev.conversationTenantId ?? ev.channelDataTenantId;
-    if (!isPersonal || !tenantId || !ev.fromAadObjectId) return 'ignored';
+    const tenantId = (ev.conversationTenantId ?? ev.channelDataTenantId)?.toLowerCase();
+    const aadObjectId = ev.fromAadObjectId?.toLowerCase();
+    if (!isPersonal || !tenantId || !aadObjectId) return 'ignored';
     try {
-      const deleted = await this.deps.references.deleteByIdentity(tenantId, ev.fromAadObjectId.toLowerCase());
-      this.deps.logger.info('reference_removed', { status: deleted ? 'deleted' : 'none' });
+      const res = await this.deps.gertrude.removeReference({ tenantId, aadObjectId });
+      switch (res.kind) {
+        case 'removed':
+          this.deps.logger.info('reference_removed', { status: res.removed ? 'removed' : 'none' });
+          break;
+        case 'unauthorized':
+          this.deps.logger.critical('reference_remove_failed', { code: 'GERTRUDE_UNAUTHORIZED' });
+          break;
+        case 'bad_request':
+          this.deps.logger.error('reference_remove_failed', { code: 'GERTRUDE_BAD_REQUEST' });
+          break;
+        case 'unavailable':
+          this.deps.logger.warn('reference_remove_failed', { code: res.code });
+          break;
+      }
     } catch {
-      this.deps.logger.error('reference_remove_failed', { code: 'DB_ERROR' });
+      this.deps.logger.warn('reference_remove_failed', { code: 'UNEXPECTED' });
     }
     return 'removed';
   }
 
   private async link(ev: InboundEvent, serviceUrl: string): Promise<InboundOutcome> {
-    const { logger, gertrude, references, ports } = this.deps;
+    const { logger, gertrude, ports } = this.deps;
 
     if (ev.channelId !== undefined && ev.channelId !== 'msteams') {
       logger.warn('inbound_refused', { code: 'WRONG_CHANNEL' });
@@ -133,45 +146,43 @@ export class InboundService {
       return 'not_set_up';
     }
 
-    const verdict = await gertrude.verify({ tenantId, aadObjectId, email });
-    switch (verdict.kind) {
+    const reference = {
+      channelId: 'msteams',
+      serviceUrl,
+      conversation: { id: ev.conversationId, conversationType: 'personal', tenantId },
+      ...(ev.botId ? { bot: { id: ev.botId } } : {}),
+      user: { id: ev.fromId, aadObjectId },
+    };
+
+    let result: LinkResult;
+    try {
+      result = await gertrude.linkReference({ tenantId, aadObjectId, email, conversationId: ev.conversationId, serviceUrl, reference });
+    } catch {
+      logger.warn('link_failed', { code: 'UNEXPECTED' });
+      return 'temporary_failure';
+    }
+    switch (result.kind) {
+      case 'created':
+        logger.info('reference_stored', { status: 'created' });
+        return 'linked';
+      case 'refreshed':
+        logger.info('reference_stored', { status: 'refreshed' });
+        return 'refreshed';
       case 'not_found':
-        logger.info('verify_result', { status: 'not_found' });
+        logger.info('link_result', { status: 'not_found' });
+        return 'not_set_up';
+      case 'conflict':
+        logger.error('link_result', { code: 'REFERENCE_CONFLICT' });
         return 'not_set_up';
       case 'unauthorized':
-        logger.critical('verify_failed', { code: 'GERTRUDE_UNAUTHORIZED' });
+        logger.critical('link_failed', { code: 'GERTRUDE_UNAUTHORIZED' });
+        return 'temporary_failure';
+      case 'bad_request':
+        logger.error('link_failed', { code: 'GERTRUDE_BAD_REQUEST' });
         return 'temporary_failure';
       case 'unavailable':
-        logger.warn('verify_failed', { code: verdict.code });
+        logger.warn('link_failed', { code: result.code });
         return 'temporary_failure';
-      case 'ok':
-        break;
-    }
-
-    try {
-      const result = await references.link({
-        userId: verdict.userId,
-        tenantId,
-        aadObjectId,
-        conversationId: ev.conversationId,
-        serviceUrl,
-        reference: {
-          channelId: 'msteams',
-          serviceUrl,
-          conversation: { id: ev.conversationId, conversationType: 'personal', tenantId },
-          ...(ev.botId ? { bot: { id: ev.botId } } : {}),
-          user: { id: ev.fromId, aadObjectId },
-        },
-      });
-      if (result.kind === 'conflict') {
-        logger.error('reference_conflict', { code: 'REFERENCE_CONFLICT', reason: result.reason });
-        return 'not_set_up';
-      }
-      logger.info('reference_stored', { status: result.kind });
-      return result.kind === 'created' ? 'linked' : 'refreshed';
-    } catch {
-      logger.error('reference_store_failed', { code: 'DB_ERROR' });
-      return 'temporary_failure';
     }
   }
 

@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { ConfigError, loadConfig } from '../src/config.js';
 
 const valid = {
-  DATABASE_URL: 'postgres://user:db-password-VALUE-xyz@host:5432/db',
   GERTRUDE_URL: 'https://gertrude.example.com/',
   GERTRUDE_VERIFY_TOKEN: 'verify-token-VALUE-xyz',
   SEND_SERVICE_TOKEN: 'send-token-VALUE-xyz',
@@ -29,6 +28,21 @@ describe('loadConfig', () => {
     expect(c.extraServiceUrlHosts).toEqual([]);
   });
 
+  it('needs no database setting, and reads none even when one is present in the environment', () => {
+    const name = ['DATABASE', 'URL'].join('_');
+    const c = loadConfig(valid);
+    expect(Object.keys(c).some((k) => /database|db|postgres/i.test(k))).toBe(false);
+    const withStray = loadConfig({ ...valid, [name]: 'postgres://user:stray-VALUE-xyz@host:5432/db' });
+    expect(withStray).toEqual(c);
+    expect(JSON.stringify(withStray)).not.toContain('stray-VALUE-xyz');
+  });
+
+  it('the config has exactly the settings the stateless bot needs', () => {
+    expect(Object.keys(loadConfig(valid)).sort()).toEqual(
+      ['clientId', 'clientSecret', 'extraServiceUrlHosts', 'gertrudeUrl', 'gertrudeVerifyToken', 'port', 'sendServiceToken', 'tenantId'],
+    );
+  });
+
   it('PORT defaults to 3978', () => {
     expect(loadConfig({ ...valid, PORT: undefined }).port).toBe(3978);
   });
@@ -40,7 +54,7 @@ describe('loadConfig', () => {
     ]);
   });
 
-  it.each(['DATABASE_URL', 'GERTRUDE_URL', 'GERTRUDE_VERIFY_TOKEN', 'SEND_SERVICE_TOKEN', 'CLIENT_ID', 'CLIENT_SECRET', 'TENANT_ID'])(
+  it.each(['GERTRUDE_URL', 'GERTRUDE_VERIFY_TOKEN', 'SEND_SERVICE_TOKEN', 'CLIENT_ID', 'CLIENT_SECRET', 'TENANT_ID'])(
     'a missing %s is named, and no value appears in the message',
     (name) => {
       const env: Record<string, string | undefined> = { ...valid };
@@ -59,7 +73,7 @@ describe('loadConfig', () => {
 
   it('reports every problem at once', () => {
     const err = fail({});
-    for (const n of ['DATABASE_URL', 'GERTRUDE_URL', 'GERTRUDE_VERIFY_TOKEN', 'SEND_SERVICE_TOKEN', 'CLIENT_ID', 'CLIENT_SECRET', 'TENANT_ID']) {
+    for (const n of ['GERTRUDE_URL', 'GERTRUDE_VERIFY_TOKEN', 'SEND_SERVICE_TOKEN', 'CLIENT_ID', 'CLIENT_SECRET', 'TENANT_ID']) {
       expect(err.variables).toContain(n);
     }
   });

@@ -1,31 +1,36 @@
 /**
- * Local proof of the link -> send round trip. Needs a local Postgres only.
+ * Local proof of the install -> send round trip. No database is needed: the bot service is stateless.
  *
- *   LOCAL_PG_ADMIN_URL=postgres://user:pass@127.0.0.1:5432/postgres npm run local:roundtrip
+ *   npm run local:roundtrip
  *
- * Real: the bot service (Express, SDK /api/messages with its own JWT validation switched on,
- * Postgres, migrations, /v1/send, idempotency). Fake and local: Gertrude (scripts/fake-gertrude.ts),
- * the Microsoft identity provider (a JWKS server that signs test tokens), the Teams roster and
- * reply calls, and the Teams sender. Real Teams is NOT involved.
+ * Real: the bot service (Express, the SDK's /api/messages with its own JWT validation switched on, the
+ * inbound install/link path, /v1/send with the service URL allowlist and idempotency). Fake and local:
+ * Gertrude (scripts/fake-gertrude.ts, which stores the conversation reference the bot sends it), the
+ * Microsoft identity provider (a JWKS server that signs test tokens), the Teams roster and reply calls,
+ * and the Teams sender. Real Teams is NOT involved.
  */
 import { randomUUID } from 'node:crypto';
-import { exportJWK, generateKeyPair, SignJWT } from 'jose';
-import pg from 'pg';
-import { PUBLIC } from '@microsoft/teams.api';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { createPool } from '../src/db.js';
+import { PUBLIC } from '@microsoft/teams.api';
+import { exportJWK, generateKeyPair, SignJWT } from 'jose';
+import { MESSAGES } from '../src/inbound.js';
 import { createLogger } from '../src/logger.js';
 import { startService } from '../src/server.js';
 import type { TeamsMessage, TeamsSender, TeamsTarget } from '../src/teamsSender.js';
 import { FAKE_VERIFY_TOKEN, startFakeGertrudeServer } from './fake-gertrude.js';
 
-const ADMIN_URL = process.env.LOCAL_PG_ADMIN_URL ?? 'postgres://bot_test:bot_test@127.0.0.1:5432/postgres';
 const SEND_TOKEN = 'local-fake-send-token-not-a-secret';
 const CLIENT_ID = '11111111-2222-4333-8444-555555555555';
 const TENANT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const AAD = 'f0f0f0f0-1111-4222-8333-444444444444';
+const STRANGER_AAD = '0a0a0a0a-1111-4222-8333-555555555555';
 const SERVICE_URL = 'https://smba.trafficmanager.net/emea/';
+const NORMALIZED_SERVICE_URL = 'https://smba.trafficmanager.net/emea';
+const CONVERSATION = 'a:local-conversation';
+const USER_ID = 'samlp|aviary|alex.example@example.com';
+const CARD = { type: 'AdaptiveCard', version: '1.5', body: [{ type: 'TextBlock', text: 'Local demo report' }] };
+const FALLBACK_TEXT = 'Local demo report (plain text)';
 
 const say = (s: string) => process.stdout.write(`${s}\n`);
 let failures = 0;
@@ -34,15 +39,16 @@ const check = (name: string, ok: boolean, detail?: unknown) => {
   if (!ok) failures += 1;
 };
 
-const dbName = `aviary_bot_local_${randomUUID().slice(0, 8)}`;
-const admin = new pg.Client({ connectionString: ADMIN_URL });
-await admin.connect();
-await admin.query(`create database ${dbName}`);
-const dbUrl = (() => {
-  const u = new URL(ADMIN_URL);
-  u.pathname = `/${dbName}`;
-  return u.toString();
-})();
+/** Polls until `ok` holds or the timeout passes. The SDK may answer before a handler has finished. */
+async function eventually<T>(read: () => T, ok: (value: T) => boolean, timeoutMs = 2000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let value = read();
+  while (!ok(value) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+    value = read();
+  }
+  return value;
+}
 
 const { publicKey, privateKey } = await generateKeyPair('RS256');
 const jwk = { ...(await exportJWK(publicKey)), kid: 'local-key', alg: 'RS256', use: 'sig' };
@@ -51,16 +57,20 @@ const idp = createServer((req, res) => {
 });
 await new Promise<void>((r) => idp.listen(0, '127.0.0.1', r));
 const idpUrl = `http://127.0.0.1:${(idp.address() as AddressInfo).port}`;
-const signToken = (claims: { serviceurl: string; aud?: string }) =>
-  new SignJWT({ serviceurl: claims.serviceurl })
+const signToken = () =>
+  new SignJWT({ serviceurl: SERVICE_URL })
     .setProtectedHeader({ alg: 'RS256', kid: 'local-key' })
     .setIssuer('https://api.botframework.com')
-    .setAudience(claims.aud ?? CLIENT_ID)
+    .setAudience(CLIENT_ID)
     .setIssuedAt()
     .setExpirationTime('10m')
     .sign(privateKey);
 
-const gertrude = await startFakeGertrudeServer({ allowedTenantIds: [TENANT] });
+const gertrudeRequests: { route: string; status: number }[] = [];
+const gertrude = await startFakeGertrudeServer({
+  allowedTenantIds: [TENANT],
+  onRequest: (info) => gertrudeRequests.push(info),
+});
 
 const teamsCalls: { target: TeamsTarget; message: TeamsMessage }[] = [];
 const fakeSender: TeamsSender = {
@@ -70,14 +80,15 @@ const fakeSender: TeamsSender = {
     return { activityId: `fake-activity-${teamsCalls.length}` };
   },
 };
+
+/** The roster the fake Teams returns for the sender of the next inbound activity. */
+const roster = { aadObjectId: AAD, email: 'Alex.Example@example.com', tenantId: TENANT };
 const replies: string[] = [];
 
 const logger = createLogger();
-const botToken = await signToken({ serviceurl: SERVICE_URL });
-const pool = createPool(dbUrl);
+const botToken = await signToken();
 const service = await startService(
   {
-    databaseUrl: dbUrl,
     gertrudeUrl: gertrude.url,
     gertrudeVerifyToken: FAKE_VERIFY_TOKEN,
     sendServiceToken: SEND_TOKEN,
@@ -89,11 +100,10 @@ const service = await startService(
   },
   logger,
   {
-    pool,
     sender: fakeSender,
     ports: {
       async getRosterMember() {
-        return { aadObjectId: AAD, email: 'Alex.Example@example.com', tenantId: TENANT };
+        return { aadObjectId: roster.aadObjectId, email: roster.email, tenantId: roster.tenantId };
       },
       async reply(_u, _c, text) {
         replies.push(text);
@@ -105,69 +115,105 @@ const service = await startService(
 );
 const base = `http://127.0.0.1:${service.port}`;
 
-const activity = (extra: Record<string, unknown> = {}) => ({
+const activity = (extra: Record<string, unknown> = {}, aadObjectId = AAD) => ({
   type: 'message',
   id: randomUUID(),
   channelId: 'msteams',
   serviceUrl: SERVICE_URL,
-  from: { id: '29:local-teams-user', aadObjectId: AAD },
+  from: { id: '29:local-teams-user', aadObjectId },
   recipient: { id: `28:${CLIENT_ID}` },
-  conversation: { id: 'a:local-conversation', conversationType: 'personal', isGroup: false, tenantId: TENANT },
+  conversation: { id: CONVERSATION, conversationType: 'personal', isGroup: false, tenantId: TENANT },
   channelData: { tenant: { id: TENANT } },
   text: 'hello',
   ...extra,
 });
 const postActivity = async (body: unknown, token?: string) =>
   fetch(`${base}/api/messages`, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body) });
-const send = async (key: string, userId = 'samlp|aviary|alex.example@example.com') =>
+const send = async (key: string, conversationId: string, serviceUrl: string) =>
   fetch(`${base}/v1/send`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${SEND_TOKEN}`, 'idempotency-key': key },
-    body: JSON.stringify({
-      user_id: userId,
-      card: { type: 'AdaptiveCard', version: '1.5', body: [{ type: 'TextBlock', text: 'Local demo report' }] },
-      fallback_text: 'Local demo report (plain text)',
-    }),
+    body: JSON.stringify({ conversation_id: conversationId, service_url: serviceUrl, card: CARD, fallback_text: FALLBACK_TEXT }),
   }).then(async (r) => ({ status: r.status, body: (await r.json()) as Record<string, unknown> }));
 
 try {
-  say(`bot on ${base}, fake Gertrude on ${gertrude.url}, database ${dbName}`);
+  say(`bot on ${base}, fake Gertrude on ${gertrude.url}`);
+
   const health = await fetch(`${base}/healthz`);
   check('GET /healthz is 200 {"ok":true}', health.status === 200 && (await health.text()) === '{"ok":true}');
 
-  const key1 = randomUUID();
-  const before = await send(key1);
-  check('send before the user linked: 404 no_reference, nothing sent', before.status === 404 && teamsCalls.length === 0, before);
+  const evil = await send(randomUUID(), CONVERSATION, 'https://evil.example.com/emea/');
+  check('send to a non-allowlisted service_url: 400 invalid_request, Teams not called', evil.status === 400 && evil.body.status === 'invalid_request' && teamsCalls.length === 0, evil);
 
   const unsigned = await postActivity(activity());
   check('inbound activity without a token is rejected by the SDK: 401', unsigned.status === 401);
+  check('an unsigned request stores nothing in Gertrude', gertrude.links().length === 0);
 
-  const linked = await postActivity(activity(), await signToken({ serviceurl: SERVICE_URL }));
+  const linked = await postActivity(activity(), await signToken());
   check('inbound personal message with a validly signed token: 200', linked.status === 200);
+  await eventually(() => replies.length, (n) => n >= 1);
   check('the user was told they are linked', replies.at(-1) === 'You will receive Aviary Assistant reports here.', replies);
-  const stored = await pool.query('select user_id, tenant_id, service_url from conversation_reference');
-  check('reference stored for the user_id Gertrude returned', stored.rowCount === 1 && stored.rows[0].user_id === 'samlp|aviary|alex.example@example.com', stored.rows);
 
-  const first = await send(key1);
-  check('send after linking: 200 sent', first.status === 200 && first.body.status === 'sent' && first.body.activity_id === 'fake-activity-1', first);
-  check('the fake Teams sender received the card and fallback text once', teamsCalls.length === 1 && teamsCalls[0]!.message.text === 'Local demo report (plain text)');
+  const links = await eventually(() => gertrude.links(), (l) => l.length > 0);
+  const [link] = links;
+  check(
+    'Gertrude stores exactly one reference, for the user_id it knows, with the normalized service URL',
+    links.length === 1 &&
+      link?.userId === USER_ID &&
+      link.conversationId === CONVERSATION &&
+      link.serviceUrl === NORMALIZED_SERVICE_URL &&
+      link.tenantId === TENANT &&
+      link.aadObjectId === AAD,
+    links,
+  );
+  if (!link) throw new Error('no reference was stored; cannot continue the round trip');
 
-  const replay = await send(key1);
+  // From here on the bot is given only what Gertrude stored: the conversation and service URL from the link.
+  const key1 = randomUUID();
+  const first = await send(key1, link.conversationId, link.serviceUrl);
+  check('send with the stored conversation and service URL: 200 sent', first.status === 200 && first.body.status === 'sent' && first.body.activity_id === 'fake-activity-1', first);
+  const sent = teamsCalls[0];
+  check(
+    'the fake Teams sender received the card and fallback text once',
+    teamsCalls.length === 1 &&
+      sent?.message.text === FALLBACK_TEXT &&
+      JSON.stringify(sent.message.card) === JSON.stringify(CARD) &&
+      sent.target.conversationId === CONVERSATION &&
+      sent.target.serviceUrl === NORMALIZED_SERVICE_URL,
+    teamsCalls.length,
+  );
+
+  const replay = await send(key1, link.conversationId, link.serviceUrl);
   check('same Idempotency-Key again: 200 replayed, Teams not called again', replay.status === 200 && replay.body.replayed === true && teamsCalls.length === 1, replay);
 
   const key2 = randomUUID();
-  const second = await send(key2);
-  check('a new key sends again', second.status === 200 && teamsCalls.length === 2, second);
+  const second = await send(key2, link.conversationId, link.serviceUrl);
+  check('a new Idempotency-Key sends again', second.status === 200 && second.body.status === 'sent' && teamsCalls.length === 2, second);
 
-  await postActivity(activity({ type: 'installationUpdate', action: 'remove' }), await signToken({ serviceurl: SERVICE_URL }));
-  const afterRemove = await send(randomUUID());
-  check('after install.remove the reference is gone: 404 no_reference', afterRemove.status === 404, afterRemove);
+  const clash = await send(key2, 'a:other-conversation', link.serviceUrl);
+  check('same key with a different conversation_id: 400, Teams not called', clash.status === 400 && clash.body.status === 'invalid_request' && teamsCalls.length === 2, clash);
+
+  // An email Gertrude does not know: the bot says so and Gertrude stores nothing new.
+  roster.email = 'stranger.example@example.com';
+  roster.aadObjectId = STRANGER_AAD;
+  const stranger = await postActivity(activity({}, STRANGER_AAD), await signToken());
+  check('inbound from an unknown email: 200', stranger.status === 200);
+  await eventually(() => replies.length, (n) => n >= 2);
+  check('unknown email: the user gets the not-set-up reply', replies.at(-1) === MESSAGES.notSetUp, replies.at(-1));
+  check('unknown email: no reference is stored for it', gertrude.links().length === 1 && gertrude.links()[0]?.userId === USER_ID);
+
+  const removed = await postActivity(activity({ type: 'installationUpdate', action: 'remove' }), await signToken());
+  check('installationUpdate remove: 200', removed.status === 200);
+  const afterRemove = await eventually(() => gertrude.links(), (l) => l.length === 0);
+  check(
+    'after remove the bot called the remove route and Gertrude dropped the reference',
+    afterRemove.length === 0 && gertrudeRequests.some((r) => r.route === 'remove' && r.status === 200),
+    gertrudeRequests,
+  );
 } finally {
   await service.stop();
   await new Promise<void>((r) => idp.close(() => r()));
   await gertrude.close();
-  await admin.query(`drop database if exists ${dbName} with (force)`);
-  await admin.end();
 }
 
 say(failures === 0 ? 'ROUND TRIP OK (fake Gertrude, fake Teams sender; real Teams not run)' : `ROUND TRIP FAILED (${failures})`);

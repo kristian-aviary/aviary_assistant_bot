@@ -6,7 +6,6 @@ export const BOT_TENANT_ID = '99999999-8888-4777-8666-555555555555';
 export const USER_TENANT_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 export const USER_AAD_ID = 'f0f0f0f0-1111-4222-8333-444444444444';
 export const USER_EMAIL = 'someone@example.com';
-export const USER_ID = 'samlp|aviary|someone@example.com';
 export const TEAMS_USER_ID = '29:1-teams-user-id-opaque';
 export const CONVERSATION_ID = 'a:1-conversation-id-opaque';
 export const CARD_TEXT = 'SECRET-CARD-TEXT-quarterly-numbers';
@@ -22,7 +21,6 @@ export const SENSITIVE = [
   USER_TENANT_ID,
   USER_AAD_ID,
   USER_EMAIL,
-  USER_ID,
   'someone',
   TEAMS_USER_ID,
   CONVERSATION_ID,
@@ -31,6 +29,10 @@ export const SENSITIVE = [
   '127.0.0.1',
   'smba.trafficmanager.net',
   'Bearer',
+  // markers of the reference object (it must never be logged)
+  'conversationType',
+  'aadObjectId',
+  'msteams',
 ];
 
 export function sampleCard(extra: Record<string, unknown> = {}) {
@@ -43,6 +45,8 @@ export function sampleCard(extra: Record<string, unknown> = {}) {
   };
 }
 
+export const ALLOWED_SERVICE_URL = 'https://smba.trafficmanager.net/emea/';
+
 export function sendBody(overrides: Record<string, unknown> = {}) {
-  return { user_id: USER_ID, card: sampleCard(), fallback_text: FALLBACK_TEXT, ...overrides };
+  return { conversation_id: CONVERSATION_ID, service_url: ALLOWED_SERVICE_URL, card: sampleCard(), fallback_text: FALLBACK_TEXT, ...overrides };
 }

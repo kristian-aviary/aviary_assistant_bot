@@ -1,10 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { CONVERSATION_ID, FALLBACK_TEXT, USER_ID, sampleCard, sendBody } from './helpers/constants.js';
+import { ALLOWED_SERVICE_URL, CONVERSATION_ID, FALLBACK_TEXT, sampleCard, sendBody as staticBody } from './helpers/constants.js';
 import { FakeTeamsSender, httpError, netError } from './helpers/fakeSender.js';
 import { createHarness, type Harness } from './helpers/harness.js';
 import { assertCleanLogsAfterAll, captureLogs } from './helpers/logs.js';
-import { seedReference } from './helpers/seed.js';
 
 const logs = captureLogs();
 assertCleanLogsAfterAll(logs);
@@ -18,14 +17,16 @@ beforeAll(async () => {
 afterAll(async () => {
   await h.stop();
 });
-beforeEach(async () => {
+beforeEach(() => {
   sender.reset();
-  await h.db.pool.query('truncate send_idempotency, conversation_reference');
-  await seedReference(h.db.pool, h.serviceUrl);
 });
 
-const rowFor = async (key: string) =>
-  (await h.db.pool.query('select status, outcome, activity_id from send_idempotency where key = $1', [key])).rows[0];
+const sendBody = (overrides: Record<string, unknown> = {}) => h.body(overrides);
+/** The stored idempotency state for a key, in the shape these tests assert on (undefined when the key is free). */
+const rowFor = (key: string) => {
+  const e = h.idempotency.find(key);
+  return e ? { status: e.status, outcome: e.outcome, activity_id: e.activityId } : undefined;
+};
 
 describe('POST /v1/send: contract section 2 result table', () => {
   it('200 sent: passes the card through unchanged with fallback_text as the message text', async () => {
@@ -36,8 +37,8 @@ describe('POST /v1/send: contract section 2 result table', () => {
     expect(r.body).toEqual({ status: 'sent', activity_id: 'act-xyz' });
     expect(sender.calls).toHaveLength(1);
     expect(sender.calls[0]!.message).toEqual({ text: FALLBACK_TEXT, card });
-    expect(sender.calls[0]!.target).toEqual({ conversationId: CONVERSATION_ID, serviceUrl: h.serviceUrl });
-    expect(await rowFor(r.key)).toMatchObject({ status: 'sent', activity_id: 'act-xyz' });
+    expect(sender.calls[0]!.target).toEqual({ conversationId: CONVERSATION_ID, serviceUrl: h.serviceUrl.replace(/\/$/, '') });
+    expect(rowFor(r.key)).toMatchObject({ status: 'sent', activity_id: 'act-xyz' });
   });
 
   it('200 replayed: a key that was already sent answers the stored result and never calls Teams again', async () => {
@@ -49,13 +50,6 @@ describe('POST /v1/send: contract section 2 result table', () => {
     expect(sender.calls).toHaveLength(1);
   });
 
-  it('a stored sent replays even after the reference was deleted (install.remove)', async () => {
-    const first = await h.send();
-    await h.db.pool.query('delete from conversation_reference');
-    const again = await h.send(sendBody(), { key: first.key });
-    expect(again.body).toMatchObject({ status: 'sent', replayed: true });
-  });
-
   it('200 sent with no activity id from Teams still answers sent', async () => {
     sender.enqueue({ type: 'ok', activityId: null });
     const r = await h.send();
@@ -63,28 +57,13 @@ describe('POST /v1/send: contract section 2 result table', () => {
     expect(r.body).toEqual({ status: 'sent', activity_id: null });
   });
 
-  it('404 no_reference: nothing is sent and the key is not claimed (a later retry after install can succeed)', async () => {
-    await h.db.pool.query('truncate conversation_reference');
-    const r = await h.send();
-    expect(r.status).toBe(404);
-    expect(r.body).toEqual({ status: 'no_reference' });
-    expect(sender.calls).toHaveLength(0);
-    expect(await rowFor(r.key)).toBeUndefined();
-
-    await seedReference(h.db.pool, h.serviceUrl);
-    const retry = await h.send(sendBody(), { key: r.key });
-    expect(retry.status).toBe(200);
-  });
-
   describe.each([403, 404])('Teams %i (not installed / blocked / conversation gone)', (status) => {
-    it('403 blocked_or_uninstalled, stored as failed_permanent, reference kept, replayed without calling Teams', async () => {
+    it('403 blocked_or_uninstalled, stored as failed_permanent, replayed without calling Teams', async () => {
       sender.enqueue({ type: 'fail', error: httpError(status), dispatched: true });
       const r = await h.send();
       expect(r.status).toBe(403);
       expect(r.body).toEqual({ status: 'blocked_or_uninstalled' });
-      expect(await rowFor(r.key)).toMatchObject({ status: 'failed_permanent', outcome: 'blocked_or_uninstalled' });
-      const refs = await h.db.pool.query('select count(*)::int as n from conversation_reference');
-      expect(refs.rows[0].n).toBe(1);
+      expect(rowFor(r.key)).toMatchObject({ status: 'failed_permanent', outcome: 'blocked_or_uninstalled' });
 
       const replay = await h.send(sendBody(), { key: r.key });
       expect(replay.status).toBe(403);
@@ -97,22 +76,29 @@ describe('POST /v1/send: contract section 2 result table', () => {
     it.each([
       ['not JSON', 'not json at all'],
       ['empty object', {}],
-      ['missing user_id', { card: sampleCard(), fallback_text: 'x' }],
-      ['missing card', { user_id: USER_ID, fallback_text: 'x' }],
-      ['missing fallback_text', { user_id: USER_ID, card: sampleCard() }],
-      ['card is a string', sendBody({ card: 'AdaptiveCard' })],
-      ['card is an array', sendBody({ card: [sampleCard()] })],
-      ['card type is wrong', sendBody({ card: { type: 'HeroCard' } })],
-      ['unknown top-level key', sendBody({ extra: true })],
-      ['user_id is a number', sendBody({ user_id: 42 })],
-      ['empty fallback_text', sendBody({ fallback_text: '' })],
+      ['missing conversation_id', { service_url: ALLOWED_SERVICE_URL, card: sampleCard(), fallback_text: 'x' }],
+      ['missing service_url', { conversation_id: CONVERSATION_ID, card: sampleCard(), fallback_text: 'x' }],
+      ['missing card', { conversation_id: CONVERSATION_ID, service_url: ALLOWED_SERVICE_URL, fallback_text: 'x' }],
+      ['missing fallback_text', { conversation_id: CONVERSATION_ID, service_url: ALLOWED_SERVICE_URL, card: sampleCard() }],
+      ['card is a string', staticBody({ card: 'AdaptiveCard' })],
+      ['card is an array', staticBody({ card: [sampleCard()] })],
+      ['card type is wrong', staticBody({ card: { type: 'HeroCard' } })],
+      ['unknown top-level key', staticBody({ extra: true })],
+      ['user_id is rejected (the bot never learns an Assistant user)', staticBody({ user_id: 'samlp|aviary|someone' })],
+      ['reference is rejected (Gertrude owns it)', staticBody({ reference: { channelId: 'msteams' } })],
+      ['conversation_id is a number', staticBody({ conversation_id: 42 })],
+      ['empty conversation_id', staticBody({ conversation_id: '' })],
+      ['conversation_id longer than 512', staticBody({ conversation_id: 'a'.repeat(513) })],
+      ['service_url is a number', staticBody({ service_url: 42 })],
+      ['service_url not on the allowlist', staticBody({ service_url: 'https://evil.example.com/emea/' })],
+      ['empty fallback_text', staticBody({ fallback_text: '' })],
     ])('%s', async (_name, body) => {
       const r = await h.send(body);
       expect(r.status).toBe(400);
       expect(r.body.status).toBe('invalid_request');
       expect(typeof r.body.detail).toBe('string');
       expect(sender.calls).toHaveLength(0);
-      expect(await rowFor(r.key)).toBeUndefined();
+      expect(rowFor(r.key)).toBeUndefined();
     });
 
     it('card larger than 25 KB', async () => {
@@ -137,9 +123,14 @@ describe('POST /v1/send: contract section 2 result table', () => {
       expect(sender.calls).toHaveLength(0);
     });
 
-    it('the same key reused for a different user is refused', async () => {
+    it('conversation_id at exactly 512 characters is accepted', async () => {
+      const r = await h.send(sendBody({ conversation_id: 'a'.repeat(512) }));
+      expect(r.status).toBe(200);
+    });
+
+    it('the same key reused for a different conversation is refused, without calling Teams', async () => {
       const first = await h.send();
-      const other = await h.send(sendBody({ user_id: 'someone-else' }), { key: first.key });
+      const other = await h.send(sendBody({ conversation_id: 'a:2-someone-else' }), { key: first.key });
       expect(other.status).toBe(400);
       expect(other.body.status).toBe('invalid_request');
       expect(sender.calls).toHaveLength(1);
@@ -155,7 +146,7 @@ describe('POST /v1/send: contract section 2 result table', () => {
       const r = await h.send();
       expect(r.status).toBe(400);
       expect(r.body.status).toBe('invalid_request');
-      expect(await rowFor(r.key)).toMatchObject({ status: 'failed_permanent', outcome: 'invalid_request' });
+      expect(rowFor(r.key)).toMatchObject({ status: 'failed_permanent', outcome: 'invalid_request' });
       const replay = await h.send(sendBody(), { key: r.key });
       expect(replay.status).toBe(400);
       expect(sender.calls).toHaveLength(1);
@@ -169,7 +160,7 @@ describe('POST /v1/send: contract section 2 result table', () => {
       expect(r.status).toBe(429);
       expect(r.body).toEqual({ status: 'rate_limited' });
       expect(r.headers.get('retry-after')).toBe('7');
-      expect(await rowFor(r.key)).toBeUndefined();
+      expect(rowFor(r.key)).toBeUndefined();
 
       sender.enqueue({ type: 'ok', activityId: 'act-after-429' });
       const retry = await h.send(sendBody(), { key: r.key });
@@ -197,7 +188,7 @@ describe('POST /v1/send: contract section 2 result table', () => {
       const r = await h.send();
       expect(r.status).toBe(503);
       expect(r.body).toEqual({ status: 'unavailable' });
-      expect(await rowFor(r.key)).toBeUndefined();
+      expect(rowFor(r.key)).toBeUndefined();
       const retry = await h.send(sendBody(), { key: r.key });
       expect(retry.status).toBe(200);
     });
@@ -206,7 +197,7 @@ describe('POST /v1/send: contract section 2 result table', () => {
       sender.enqueue({ type: 'hang', dispatched: false });
       const r = await h.send();
       expect(r.status).toBe(503);
-      expect(await rowFor(r.key)).toBeUndefined();
+      expect(rowFor(r.key)).toBeUndefined();
     });
   });
 
@@ -217,7 +208,7 @@ describe('POST /v1/send: contract section 2 result table', () => {
     expect(r.status).toBe(503);
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(outcome).toEqual({ dispatchBlocked: true });
-    expect(await rowFor(r.key)).toBeUndefined();
+    expect(rowFor(r.key)).toBeUndefined();
   });
 
   describe('409 unknown: Teams may have accepted it', () => {
@@ -236,7 +227,7 @@ describe('POST /v1/send: contract section 2 result table', () => {
       const r = await h.send();
       expect(r.status).toBe(409);
       expect(r.body).toEqual({ status: 'unknown' });
-      expect(await rowFor(r.key)).toMatchObject({ status: 'unknown' });
+      expect(rowFor(r.key)).toMatchObject({ status: 'unknown' });
     });
 
     it('the deadline firing after dispatch is unknown, and a late success never upgrades it', async () => {
@@ -247,7 +238,7 @@ describe('POST /v1/send: contract section 2 result table', () => {
       expect(r.status).toBe(409);
       release();
       await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(await rowFor(r.key)).toMatchObject({ status: 'unknown', activity_id: null });
+      expect(rowFor(r.key)).toMatchObject({ status: 'unknown', activity_id: null });
     });
 
     it('replay of a stored unknown answers 409 and never calls the sender again', async () => {
@@ -262,9 +253,9 @@ describe('POST /v1/send: contract section 2 result table', () => {
       expect(sender.calls).toHaveLength(1);
     });
 
-    it('a key left in_progress (for example a crash mid-send) replays as 409 unknown', async () => {
+    it('a key left in_progress (for example a send cut off at shutdown) replays as 409 unknown', async () => {
       const key = randomUUID();
-      await h.db.pool.query(`insert into send_idempotency (key, user_id, status) values ($1, $2, 'in_progress')`, [key, USER_ID]);
+      expect(h.idempotency.claim(key, CONVERSATION_ID)).toEqual({ claimed: true });
       const r = await h.send(sendBody(), { key });
       expect(r.status).toBe(409);
       expect(r.body).toEqual({ status: 'unknown' });

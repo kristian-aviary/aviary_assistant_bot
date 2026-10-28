@@ -6,7 +6,6 @@ export type HttpAppDeps = {
   sendService: SendService;
   /** The bearer is checked before the body is read or parsed. */
   sendToken: string;
-  ping: () => Promise<boolean>;
   logger: Logger;
 };
 
@@ -14,9 +13,9 @@ export type HttpAppDeps = {
 export function mountRoutes(app: Express, deps: HttpAppDeps): void {
   app.disable('x-powered-by');
 
-  app.get('/healthz', async (_req, res) => {
-    const ok = await deps.ping();
-    res.status(ok ? 200 : 503).json({ ok });
+  // Liveness only: no auth, no secrets, no dependency checks (the bot has no database).
+  app.get('/healthz', (_req, res) => {
+    res.status(200).json({ ok: true });
   });
 
   const guard = (req: Request, res: Response, next: NextFunction) => {

@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { createLogger, createSdkLogger } from '../src/logger.js';
-import { CARD_TEXT, SENSITIVE, USER_AAD_ID, USER_EMAIL, USER_ID } from './helpers/constants.js';
+import { CARD_TEXT, SENSITIVE, USER_AAD_ID, USER_EMAIL } from './helpers/constants.js';
 import { expectCleanLogs } from './helpers/logs.js';
+
+// Shaped like a user id with pipes; the logger must refuse it whatever it is called.
+const USER_ID = 'samlp|aviary|someone@example.com';
 
 describe('logger allowlist', () => {
   const make = () => {

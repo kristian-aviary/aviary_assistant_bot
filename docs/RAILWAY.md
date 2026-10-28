@@ -18,50 +18,70 @@ variables below.
 ## Service
 
 1. New project, "Deploy from GitHub repo", `kristian-aviary/aviary_assistant_bot`, branch `main`.
-2. Add the PostgreSQL plugin to the project. Migrations run at start from the service; nothing to run by hand.
-3. One replica is enough. If two run (during a deploy, Railway overlaps old and new), correctness holds: sends are
-   guarded by the Postgres idempotency claim and migrations by an advisory lock.
+2. Run **exactly one replica**. The idempotency guard is in memory and per process, so a second replica would have
+   its own empty guard. See [Replicas and deploys](#replicas-and-deploys).
+3. No volume. The service keeps no state on disk, and there is no database in this project: no database plugin,
+   no `DATABASE_URL`, no migrations.
 
 ### Variables (names only; no values here)
 
 | Variable | Source |
 |---|---|
-| `DATABASE_URL` | reference the plugin: `${{Postgres.DATABASE_URL}}` (the private-network URL, not the public proxy) |
 | `GERTRUDE_URL` | Gertrude's API base URL |
-| `GERTRUDE_VERIFY_TOKEN` | same value as Gertrude's `TEAMS_BOT_VERIFY_TOKEN` |
-| `SEND_SERVICE_TOKEN` | same value as Gertrude's `TEAMS_BOT_SERVICE_TOKEN`; must differ from the one above (startup refuses equal values) |
+| `GERTRUDE_VERIFY_TOKEN` | bearer the bot presents to Gertrude; same value as Gertrude's `TEAMS_BOT_VERIFY_TOKEN` (`BOT_TO_GERTRUDE_TOKEN`) |
+| `SEND_SERVICE_TOKEN` | bearer Gertrude presents to `POST /v1/send`; same value as Gertrude's `TEAMS_BOT_SERVICE_TOKEN` (`GERTRUDE_TO_BOT_TOKEN`); must differ from `GERTRUDE_VERIFY_TOKEN` (startup refuses equal values) |
 | `CLIENT_ID`, `CLIENT_SECRET`, `TENANT_ID` | the bot registration (see [TEAMS-SETUP.md](TEAMS-SETUP.md)) |
+| `SERVICE_URL_ALLOWED_HOSTS` | optional; comma separated extra Bot Framework service URL hosts; default `smba.trafficmanager.net` |
 | `PORT` | set by Railway; do not set it yourself |
-| `SERVICE_URL_ALLOWED_HOSTS` | optional |
-| `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` | set to `15` (see SIGTERM) |
 
 Startup fails with `Invalid configuration: missing <NAME>` (exit 1, no values printed) if one is absent, and the
 deploy is marked failed.
 
 ### Health check
 
-Settings, Deploy, Healthcheck Path: `/healthz`. It answers `200 {"ok":true}` only when Postgres answers (2 s
-cap) and `503 {"ok":false}` otherwise; no auth, no secrets. A timeout of 60 s is plenty (migrations run before
-the server listens).
+Settings, Deploy, Healthcheck Path: `/healthz`. It answers `200 {"ok":true}` while the process is serving. It is
+unauthenticated and has no database check, because there is no database.
 
 ### Start command
 
-Leave it empty: the Dockerfile's `CMD ["node", "dist/main.js"]` is used. To run migrations on their own
-(optional), the same image has `node dist/migrate.js`.
+Leave it empty: the Dockerfile's `CMD ["node", "dist/main.js"]` is used.
+
+## Replicas and deploys
+
+- **One replica only.** The idempotency guard that stops a send from going to Teams twice lives in process memory.
+  Two replicas would each keep their own guard, so the at-most-once protection would no longer hold.
+- **No overlap.** A deploy must not run the new instance alongside the old one for the same reason. Use stop-then-start:
+  the old instance is stopped before the new one serves. Do not rely on a zero-downtime overlap.
+- Gertrude retries only failures that the bot did not accept, and it answers new requests with `503 unavailable`
+  while it is shutting down, so a short gap during a deploy is safe. See [SIGTERM](#sigterm).
+
+## State is lost on restart
+
+The bot keeps its idempotency guard in memory only. A restart or redeploy empties it. That is acceptable:
+
+- Gertrude never retries an `unknown` outcome. It retries only failures that the bot did not accept (the explicit
+  `failed_retryable` answers and failures before the request was written). A connection lost mid-request is
+  `unknown` on Gertrude's side, so it is not retried.
+- Gertrude owns the conversation reference in its own database. Nothing about who-to-message is lost on restart,
+  because the bot never stored it.
+- A restart can allow a duplicate only if Gertrude re-sent the same delivery (same `Idempotency-Key`) after the
+  bot had lost its record. Gertrude's at-most-once delivery state prevents that re-send, so this is not expected
+  to happen.
 
 ## SIGTERM
 
-Railway sends `SIGTERM` to the old deployment when a new one is live, then `SIGKILL` after the draining time.
+Railway sends `SIGTERM` to a deployment when it is replaced or stopped, then `SIGKILL` after the draining time.
 The service handles `SIGTERM` (and `SIGINT`):
 
 1. `/v1/send` immediately answers `503 unavailable` for anything new, and claims no keys, so Gertrude retries.
 2. The listener closes; idle connections are dropped, busy ones finish.
 3. In-flight sends are awaited for up to 10 s (the Teams call itself is capped at 8 s).
-4. A short flush, remaining sockets are cut, the Postgres pool is closed, exit 0.
+4. A short flush, remaining sockets are cut, exit 0.
 
-A send still running at the deadline is left `in_progress` in Postgres, which replays as `409 unknown`: never a
-duplicate. Because the drain budget is about 11 s, set `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15`; the Railway
-default may be shorter, and then in-flight sends would be killed (still safe, but they become `unknown`).
+A send still running at the deadline is cut off with its connection. Gertrude sees a connection lost after the
+request was written, which is `unknown`, and it never retries that. Because the drain budget is about 11 s, set the
+Railway service setting `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15`; the Railway default may be shorter, and then
+in-flight sends would be killed (still safe, but they become `unknown`).
 A second signal exits immediately.
 
 ## Messaging endpoint
@@ -82,19 +102,18 @@ A second signal exits immediately.
 
 A new generated domain, a removed custom domain or a service recreated all change the host. Until the endpoint is
 updated Teams cannot reach the bot: users get no link replies and `install.add` is lost (sends still work, since
-stored references do not depend on the endpoint, but nothing new links). Run the `teams app update ... --endpoint`
-command above with the new host, immediately. A custom domain avoids most of this and is recommended before the
-pilot goes to customers. Tell Gertrude's side nothing changes: `TEAMS_BOT_URL` is the same host, so update it too
-if the host changed.
+Gertrude holds the conversation reference and does not depend on the endpoint, but nothing new links). Run the
+`teams app update ... --endpoint` command above with the new host, immediately. A custom domain avoids most of
+this and is recommended before the pilot goes to customers. Tell Gertrude's side nothing changes: `TEAMS_BOT_URL`
+is the same host, so update it too if the host changed.
 
 ## Operations notes
 
 - Logs are JSON, one object per line: fields are `ts`, `level`, `event` and only allowlisted names (`delivery_id`,
   `status`, `code`, `reason`, `http_status`, `phase`, `route`, `duration_ms`, `count`, `port`). Nothing else can be
-  logged by construction. Useful events: `reference_conflict`, `verify_failed` (`GERTRUDE_UNAUTHORIZED` is
-  level `critical`), `send_failed`, `send_replayed`, `sdk_log` (the SDK complained; it prints no detail).
-- Idempotency keys are purged after 45 days (the contract needs at least 30), on start and daily.
-- Backups: use Railway's Postgres backups. Losing `conversation_reference` only means users must message the bot
-  again; losing `send_idempotency` loses the at-most-once memory for recent deliveries.
+  logged by construction. Useful events include `link_result` (code `REFERENCE_CONFLICT`), `send_failed`, `send_replayed`, and `sdk_log`
+  (the SDK complained; it prints no detail). `GERTRUDE_UNAUTHORIZED` is level `critical`.
+- Idempotency keys are held in memory only, for 24 hours, and are lost on restart (see
+  [State is lost on restart](#state-is-lost-on-restart)).
 - Rotating the two bearer tokens: change the variable on both sides in one window; there is no overlap support in
   v0, so a send in that window gets `401` (Gertrude treats it as retryable).

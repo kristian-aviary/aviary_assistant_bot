@@ -1,12 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { startService } from '../src/server.js';
-import { sendBody } from './helpers/constants.js';
 import { FakeTeamsSender } from './helpers/fakeSender.js';
 import { createHarness, type Harness } from './helpers/harness.js';
 import { captureLogs } from './helpers/logs.js';
-import { seedReference } from './helpers/seed.js';
-import { createTestDb } from './helpers/pg.js';
 
 let h: Harness | undefined;
 afterEach(async () => {
@@ -15,19 +12,21 @@ afterEach(async () => {
 });
 
 describe('GET /healthz', () => {
-  it('200 {"ok":true} when the database answers, with no secrets in the body', async () => {
+  it('200 {"ok":true} with no secrets in the body, and no dependency anywhere to check', async () => {
     h = await createHarness();
     const res = await fetch(`${h.baseUrl}/healthz`);
     expect(res.status).toBe(200);
     expect(await res.text()).toBe('{"ok":true}');
   });
 
-  it('needs no auth, and answers 503 {"ok":false} when the database does not', async () => {
+  it('needs no auth, and keeps answering 200 while Gertrude and Teams are down (it is liveness, not readiness)', async () => {
     h = await createHarness();
-    await h.db.pool.end();
+    await h.gertrude.close();
+    await h.connector.close();
     const res = await fetch(`${h.baseUrl}/healthz`);
-    expect(res.status).toBe(503);
-    expect(await res.json()).toEqual({ ok: false });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true });
+    expect(res.headers.get('www-authenticate')).toBeNull();
   });
 });
 
@@ -39,10 +38,12 @@ describe('startup', () => {
     expect(res.status).toBe(200);
   });
 
-  it('runs migrations at start against an empty database', async () => {
+  it('starts with no database anywhere: the only state is the in-memory idempotency store', async () => {
     h = await createHarness();
-    const t = await h.db.pool.query(`select count(*)::int as n from information_schema.tables where table_name in ('conversation_reference','send_idempotency','schema_migrations')`);
-    expect(t.rows[0].n).toBe(3);
+    expect(h.idempotency.size).toBe(0);
+    expect(h.service.idempotency).toBe(h.idempotency);
+    expect((await h.send()).status).toBe(200);
+    expect(h.idempotency.size).toBe(1);
   });
 });
 
@@ -50,13 +51,12 @@ describe('graceful shutdown (SIGTERM path: service.stop())', () => {
   it('finishes the in-flight send, answers it normally, refuses new sends, then closes', async () => {
     const sender = new FakeTeamsSender();
     h = await createHarness({ sender });
-    await seedReference(h.db.pool, h.serviceUrl);
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     sender.enqueue({ type: 'gate', gate, then: { type: 'ok', activityId: 'act-drain' } });
 
     const inFlightKey = randomUUID();
-    const inFlight = h.send(sendBody(), { key: inFlightKey });
+    const inFlight = h.send(h.body(), { key: inFlightKey });
     await until(() => sender.calls.length === 1);
 
     const stopping = h.service.stop();
@@ -78,25 +78,21 @@ describe('graceful shutdown (SIGTERM path: service.stop())', () => {
     expect(h.service.sendService.inFlightCount).toBe(0);
   });
 
-  it('a send that outlives the drain deadline is left in_progress, which replays as unknown (never a duplicate)', async () => {
+  it('a send that outlives the drain deadline is left in_progress, which would replay as unknown (never a duplicate)', async () => {
     const sender = new FakeTeamsSender();
     h = await createHarness({ sender, drainTimeoutMs: 200 });
-    await seedReference(h.db.pool, h.serviceUrl);
     sender.enqueue({ type: 'hang', dispatched: true });
     const key = randomUUID();
-    const pending = h.send(sendBody(), { key }).catch(() => 'cut');
+    const pending = h.send(h.body(), { key }).catch(() => 'cut');
     await until(() => sender.calls.length === 1);
     await h.service.stop();
     expect(await pending).toBe('cut');
-    const row = (await h.db.pool.query('select status from send_idempotency where key = $1', [key])).rows[0];
-    expect(row.status).toBe('in_progress');
+    expect(h.idempotency.find(key)?.status).toBe('in_progress');
   });
 
-  it('stop is idempotent and closes the pool it owns', async () => {
-    const db = await createTestDb();
+  it('stop is idempotent', async () => {
     const logs = captureLogs();
     const config = {
-      databaseUrl: db.url,
       gertrudeUrl: 'http://127.0.0.1:9',
       gertrudeVerifyToken: 'v'.repeat(20),
       sendServiceToken: 's'.repeat(20),
@@ -110,7 +106,6 @@ describe('graceful shutdown (SIGTERM path: service.stop())', () => {
     await Promise.all([svc.stop(), svc.stop()]);
     expect(svc.server.listening).toBe(false);
     expect(logs.lines.some((l) => l.includes('service_started'))).toBe(true);
-    await db.drop();
   });
 });
 
