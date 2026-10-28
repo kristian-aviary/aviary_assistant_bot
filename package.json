@@ -1,0 +1,49 @@
+{
+  "name": "aviary-assistant-bot",
+  "version": "0.1.0",
+  "description": "Microsoft Teams bot service that delivers Aviary Assistant hypercare reports to people in Teams.",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "migrate": "node dist/migrate.js",
+    "dev": "tsx src/main.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "package:app": "tsx scripts/package-app.ts",
+    "local:roundtrip": "tsx scripts/local-roundtrip.ts",
+    "fake:gertrude": "tsx scripts/fake-gertrude.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kristian-aviary/aviary_assistant_bot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kristian-aviary/aviary_assistant_bot/issues"
+  },
+  "homepage": "https://github.com/kristian-aviary/aviary_assistant_bot#readme",
+  "dependencies": {
+    "@microsoft/teams.api": "2.1.1",
+    "@microsoft/teams.apps": "2.1.1",
+    "@microsoft/teams.common": "2.1.1",
+    "express": "^5.3.0",
+    "pg": "^8.23.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.5",
+    "@types/pg": "^8.23.1",
+    "ajv": "^8.20.0",
+    "ajv-draft-04": "^1.0.0",
+    "fflate": "^0.8.3",
+    "jose": "^6.2.13",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
